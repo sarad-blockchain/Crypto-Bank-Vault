@@ -1,4 +1,4 @@
-# 🏦 CryptoBankVault
+# CryptoBankVault
 
 > A non-custodial ETH vault with share-based accounting and ERC20 token rewards, built on Solidity ^0.8.34.
 
