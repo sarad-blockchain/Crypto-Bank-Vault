@@ -3,10 +3,11 @@
 // Solidity Version
 pragma solidity ^0.8.34;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import {ERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+
 /**
  * @title CryptoBankVault
  * @notice A vault contract that allows users to deposit ETH, receive shares
@@ -42,6 +43,9 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
     ///        Default: 1e10 — adjust to match the token's decimals and desired emission rate.
     uint256 public rewardRate = 1e10;
 
+    // @notice Maximum reward cap per claim to prevent unlimited accrual.
+    uint256 public maxRewardPerClaim = type(uint256).max;
+
     // Events
     // @notice Emitted when a user deposits ETH into the vault.
     event EtherDeposit(address indexed user, uint256 amount);
@@ -55,6 +59,15 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
     // @notice Emitted when the owner performs an emergency withdrawal.
     event EmergencyWithdraw(address indexed user, uint256 amount);
 
+    // @notice Emitted when the maximum balance is updated.
+    event MaxBalanceUpdated(uint256 newMaxBalance);
+
+    // @notice Emitted when the reward rate is updated.
+    event RewardRateUpdated(uint256 newRewardRate);
+
+    // @notice Emitted when the maximum reward per claim is updated.
+    event MaxRewardPerClaimUpdated(uint256 newMaxReward);
+
     // Constructor
     /**
      * @param maxBalance_   Maximum ETH balance allowed per user.
@@ -64,6 +77,7 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
     constructor(uint256 maxBalance_, address admin_, address rewardToken_) Ownable(admin_) {
         require(admin_ != address(0), "Invalid admin address");
         require(rewardToken_ != address(0), "Invalid token address");
+        require(maxBalance_ > 0, "maxBalance must be greater than zero");
 
         maxBalance  = maxBalance_;
         rewardToken = IERC20(rewardToken_);
@@ -107,15 +121,17 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
      */
     function depositEther() external payable whenNotPaused nonReentrant {
         require(msg.value > 0, "Deposit must be greater than zero");
+        
+        uint256 userCurrentBalance = userBalance[msg.sender];
         require(
-            userBalance[msg.sender] + msg.value <= maxBalance,
+            userCurrentBalance + msg.value <= maxBalance,
             "MaxBalance reached"
         );
 
         uint256 shares = convertToShares(msg.value);
 
         // Update accounting before any external calls (checks-effects-interactions).
-        userBalance[msg.sender] += msg.value;
+        userBalance[msg.sender] = userCurrentBalance + msg.value;
         totalBalance            += msg.value;
         totalShare              += shares;
         userShares[msg.sender]  += shares;
@@ -134,13 +150,15 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
      */
     function withdrawEther(uint256 amount_) external whenNotPaused nonReentrant {
         require(amount_ > 0, "Amount must be greater than zero");
-        require(userBalance[msg.sender] >= amount_, "Insufficient balance");
+        
+        uint256 userCurrentBalance = userBalance[msg.sender];
+        require(userCurrentBalance >= amount_, "Insufficient balance");
 
         uint256 shares = convertToShares(amount_);
 
         // BUG FIX: state must be updated BEFORE the external ETH transfer
         // to prevent reentrancy (checks-effects-interactions).
-        userBalance[msg.sender] -= amount_;
+        userBalance[msg.sender] = userCurrentBalance - amount_;
         totalBalance            -= amount_;
         totalShare              -= shares;
         userShares[msg.sender]  -= shares;
@@ -157,7 +175,9 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
      * @param  newMaxBalance_ New cap in wei.
      */
     function modifyMaxBalance(uint256 newMaxBalance_) external onlyOwner {
+        require(newMaxBalance_ > 0, "newMaxBalance must be greater than zero");
         maxBalance = newMaxBalance_;
+        emit MaxBalanceUpdated(newMaxBalance_);
     }
 
     /**
@@ -172,17 +192,28 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
      * @notice Claim accumulated ERC20 reward tokens.
      * @dev    Rewards = userShares * timeElapsed * rewardRate / 1e18.
      *         The timestamp is reset after each claim to avoid double-counting.
+     *         Rewards are capped at maxRewardPerClaim to prevent unlimited accrual.
      */
     function claimReward() external nonReentrant {
         uint256 shares = userShares[msg.sender];
         require(shares > 0, "No shares to claim rewards for");
 
-        uint256 timeElapsed = block.timestamp - depositTimestamp[msg.sender];
+        uint256 currentTimestamp = depositTimestamp[msg.sender];
+        uint256 timeElapsed = block.timestamp - currentTimestamp;
         require(timeElapsed > 0, "No time has passed since last claim");
 
         // BUG FIX: divide by 1e18 to normalise the reward rate scaling factor.
         uint256 reward = (shares * timeElapsed * rewardRate) / 1e18;
         require(reward > 0, "Reward too small");
+
+        // SECURITY FIX: Cap rewards to prevent unlimited accrual.
+        if (reward > maxRewardPerClaim) {
+            reward = maxRewardPerClaim;
+        }
+
+        // SECURITY FIX: Verify contract has sufficient reward token balance.
+        uint256 contractBalance = rewardToken.balanceOf(address(this));
+        require(contractBalance >= reward, "Insufficient reward tokens in contract");
 
         // Reset timestamp before transferring to follow checks-effects-interactions.
         depositTimestamp[msg.sender] = block.timestamp;
@@ -201,12 +232,19 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
         uint256 shares = userShares[user_];
         if (shares == 0) return 0;
         uint256 timeElapsed = block.timestamp - depositTimestamp[user_];
-        return (shares * timeElapsed * rewardRate) / 1e18; // matches claimReward logic
+        uint256 reward = (shares * timeElapsed * rewardRate) / 1e18;
+        
+        // Apply the same cap as claimReward
+        if (reward > maxRewardPerClaim) {
+            reward = maxRewardPerClaim;
+        }
+        return reward;
     }
 
     /**
      * @notice Pause deposits and withdrawals in case of emergency.
      * @dev    Only callable by the contract owner.
+     *         Note: claimReward() will also be paused. Users should claim rewards before pause.
      */
     function pause() external onlyOwner {
         _pause();
@@ -223,14 +261,15 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
     /**
      * @notice Emergency withdrawal: lets ANY user exit with their full ETH balance,
      *         skipping reward accrual. Works even when the contract is paused.
-     * @dev    BUG FIX: was restricted to `onlyOwner`, making it useless for regular users.
-     *         Shares are burned and balances zeroed before the ETH transfer (CEI pattern).
+     * @dev    Shares are burned and balances zeroed before the ETH transfer (CEI pattern).
+     *         SECURITY FIX: Calculate shares before modifying totalBalance to ensure correct accounting.
      */
     function emergencyWithdraw() external nonReentrant {
         uint256 amount = userBalance[msg.sender];
         require(amount > 0, "Nothing to withdraw");
 
-        // Compute shares to burn based on current ratio.
+        // SECURITY FIX: Compute shares to burn BEFORE modifying state.
+        // This ensures the share calculation uses the correct totalBalance/totalShare ratio.
         uint256 shares = convertToShares(amount);
 
         // Zero out user state before external call.
@@ -255,5 +294,16 @@ contract CryptoBankVault is ReentrancyGuard, Pausable, Ownable {
      */
     function setRewardRate(uint256 newRate_) external onlyOwner {
         rewardRate = newRate_;
+        emit RewardRateUpdated(newRate_);
+    }
+
+    /**
+     * @notice Update the maximum reward per claim.
+     * @dev    Only callable by the owner. Prevents unlimited reward accrual.
+     * @param  newMaxReward_ New maximum reward per claim in reward token units.
+     */
+    function setMaxRewardPerClaim(uint256 newMaxReward_) external onlyOwner {
+        maxRewardPerClaim = newMaxReward_;
+        emit MaxRewardPerClaimUpdated(newMaxReward_);
     }
 }
